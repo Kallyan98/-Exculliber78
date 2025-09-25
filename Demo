@@ -296,3 +296,130 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import traceback
+from datetime import datetime
+import json
+import pandas as pd
+from dateutil import parser as dateparser
+import psutil
+
+# -------------------------
+# CONFIG: set your output path here
+# -------------------------
+OUTPUT_BASE = r"D:\PII_input\Reports"
+
+# -------------------------
+# Helpers
+# -------------------------
+def parse_datetime(s):
+    try:
+        return dateparser.parse(str(s))
+    except Exception:
+        return None
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def write_text(path, text, mode="w"):
+    with open(path, mode, encoding="utf-8", errors="replace") as f:
+        f.write(text)
+
+def run_cmd(cmd, timeout=30):
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+    except Exception as e:
+        return -1, "", str(e)
+
+def format_time(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+# -------------------------
+# Parse master sheet
+# -------------------------
+def parse_master(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xls", ".xlsx"):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+
+    if not {"id","startdatetime","enddatetime"} <= set(c.lower() for c in df.columns):
+        raise ValueError("Master must have columns: id,startdatetime,enddatetime")
+
+    items = []
+    for _, row in df.iterrows():
+        ident = str(row["id"])
+        start = parse_datetime(row["startdatetime"])
+        end = parse_datetime(row["enddatetime"])
+        if start and end:
+            items.append({"id": ident, "start": start, "end": end})
+    return items
+
+# -------------------------
+# Collectors
+# -------------------------
+def collect_system_logs(start, end, out_dir):
+    if sys.platform.startswith("linux"):
+        cmd = f"journalctl --since='{format_time(start)}' --until='{format_time(end)}' --no-pager"
+        rc, out, err = run_cmd(cmd, timeout=60)
+        write_text(os.path.join(out_dir, "journalctl.txt"), out + ("\n\n" + err if err else ""))
+    elif sys.platform == "win32":
+        query = f"*[System[TimeCreated[@SystemTime>='{start.isoformat()}Z' and @SystemTime<='{end.isoformat()}Z']]]"
+        cmd = f'wevtutil qe System /q:"{query}" /f:text'
+        rc, out, err = run_cmd(cmd, timeout=60)
+        write_text(os.path.join(out_dir, "windows_events.txt"), out + ("\n\n" + err if err else ""))
+    elif sys.platform == "darwin":
+        cmd = f"log show --style syslog --start '{format_time(start)}' --end '{format_time(end)}'"
+        rc, out, err = run_cmd(cmd, timeout=60)
+        write_text(os.path.join(out_dir, "macos_log.txt"), out + ("\n\n" + err if err else ""))
+
+def collect_process_snapshot(out_dir):
+    procs = []
+    for p in psutil.process_iter(['pid','name','username','create_time','cmdline']):
+        try:
+            info = p.info
+            if info.get("create_time"):
+                info["create_time"] = datetime.fromtimestamp(info["create_time"]).isoformat()
+            procs.append(info)
+        except Exception:
+            continue
+    write_text(os.path.join(out_dir, "process_snapshot.json"), json.dumps(procs, indent=2))
+
+# -------------------------
+# Main flow
+# -------------------------
+def process_entry(entry):
+    ident, start, end = entry["id"], entry["start"], entry["end"]
+    print(f"[+] Processing {ident}: {start} -> {end}")
+    folder = ensure_dir(os.path.join(OUTPUT_BASE, f"{ident}_{start.strftime('%Y%m%dT%H%M%S')}"))
+    meta = {"id": ident, "start": start.isoformat(), "end": end.isoformat()}
+    write_text(os.path.join(folder, "meta.json"), json.dumps(meta, indent=2))
+
+    try:
+        collect_system_logs(start, end, folder)
+        collect_process_snapshot(folder)
+    except Exception:
+        write_text(os.path.join(folder, "error.txt"), traceback.format_exc())
+
+    print(f"[+] Finished {ident}, report at {folder}")
+
+def main():
+    master = r"D:\PII_input\master.csv"   # <-- set your master sheet path
+    items = parse_master(master)
+    ensure_dir(OUTPUT_BASE)
+
+    for entry in items:
+        process_entry(entry)
+
+if __name__ == "__main__":
+    main()
